@@ -22,3 +22,9 @@ dist/
 *.ckpt
 *.pt
 *.pth
+
+!h3_v100_sol_cuda.cp312-win_amd64.pyd
+!h3_v100_qk_cuda.cp312-win_amd64.pyd
+!h3_v100_mlp_cuda.cp312-win_amd64.pyd
+!assets/demo-575.mp4
+!assets/demo-575.jpg

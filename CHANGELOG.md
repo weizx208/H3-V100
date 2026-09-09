@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.0
+
+- Added dual-V100 execution for Flash and SOL, with automatic or explicit secondary-GPU selection.
+- Added scaled FP8 E4M3 support alongside INT8 ConvRot.
+- Added SOL Quality / Speed / Ultra / Manual presets and integrated EasyCache Off / Quality / Speed.
+- Improved two-stage sampling, audio/video safeguards, and memory coordination for longer sequences and repeated runs.
+- Upgrade by replacing the complete old folder, restarting ComfyUI, and adding a fresh Optimize node.
+
 ## v1.4.1
 
 - Fixed repeat-run AIMDO `hostbuf_read_file_slice` process aborts by releasing

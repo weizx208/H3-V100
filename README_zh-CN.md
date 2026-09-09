@@ -1,137 +1,123 @@
-# H3_V100
+# H3 V100 Optimize 2.0
 
 简体中文 | [English](README.md)
 
-`H3_V100` 是面向 NVIDIA Tesla V100（SM70）的 MiniMax H3 ComfyUI
-优化节点。v1.4.1 将已经完成实机验证的精度、显存和权重策略固定为稳定配置，
-并精简工作流接口。
+面向 NVIDIA V100 的 MiniMax H3 ComfyUI 加速节点，将模型优化、Flash / SOL、EasyCache 和双卡支持集中在一个节点中。
 
-节点只修改流经它的克隆 `MODEL`，不会改写 ComfyUI 或其他自定义节点文件。
-它会严格识别经过验证的 50-block MiniMax H3 结构，其他模型会被拒绝。
+2.0 延续 1.4.1 的混合精度加速、自动显存管理和连续运行保护，进一步扩展模型格式、加速选项与工作流支持。节点作用于传入的 MODEL 分支，不改写 ComfyUI 或其他节点的源文件；仅适用于受支持的 MiniMax H3 模型结构。
 
-## 稳定版内置策略
+## 演示
 
-- ComfyUI Dynamic VBAR 独占压缩权重驻留；不建立第二套 INT8 GPU staging。
-- H3 进入采样前卸载已经失活的前阶段 CUDA Dynamic 模型，释放文本编码阶段
-  占用，同时保留当前采样所需模型。
-- 下一轮加载文本编码器前卸载本节点上一轮留下的 H3 Dynamic 模型，避免连续运行
-  时 AIMDO VBAR 拷贝因显存不足而直接终止进程。
-- 主残差流、文本前路径和音频 query 安全路径保持 FP32；QKV、主 Attention
-  和大型 MLP linear 使用经过验证的 FP16 计算岛。
-- Attention 固定使用 `/16` 预缩放，并在无 bias 的 output projection 后以
-  FP32 恢复。
-- scaled FP16 SwiGLU 固定开启：value branch `/16`、fc2 输入 `/8`，最终以
-  FP32 恢复组合比例。
-- MLP 根据真实 driver-free VRAM 自适应分块。每次 MLP 内只展开一次 fc1/fc2
-  权重并供全部 activation chunks 复用，调用结束立即释放。
-- 超长序列启用有界 QKV、Q/K Norm+RoPE 和 output projection 分块。
+[![575 视频演示](assets/demo-575.jpg)](assets/demo-575.mp4)
+
+[观看带声音的视频](assets/demo-575.mp4)：5 秒，0.7 MP 放大 2 倍至 2304×1280，双采、双卡，SOL Speed + EasyCache Speed。
+
+## 主要功能
+
+- **基础推理加速**：针对 V100 优化 H3 计算，在关键画面与音频环节保留精度保护。
+- **自适应显存管理**：根据可用资源调整分块，复用已准备的权重，并协调文本编码、采样及下一轮运行之间的资源释放。
+- **双卡加速**：支持两张 V100，自动选择或手动指定副卡。
+- **FP8 支持**：支持 scaled FP8 E4M3 UNet，保留 INT8 ConvRot 路线。
+- **SOL 档位**：Quality、Speed、Ultra 和 Manual，按需要选择画质与速度。
+- **EasyCache**：Off、Quality、Speed，加入音视频分别保护的缓存加速。
+- **双采支持完善**：支持两段采样，可配合 latent 放大及 Sigma Refiner。
+
+基础计算与显存策略自动生效，无需另外连接显存管理节点。相对 1.4.1 的新增内容见 [2.0 更新说明](RELEASE_NOTES.md)。
+
+## 运行环境
+
+| 项目 | 要求与验证范围 |
+|---|---|
+| 显卡 | NVIDIA Tesla V100（SM70）；已验证单张 16 GB 和双张 16 GB |
+| 系统与 Python | Windows x64、Python 3.12 |
+| PyTorch | 2.8.0+cu128 |
+| ComfyUI | 包含 MiniMax H3 与 DynamicVRAM 支持的版本 |
+| UNet | INT8 ConvRot 或 scaled FP8 E4M3；不代表支持所有同名量化格式 |
+
+不需要额外安装 pip 包，也不要为安装本节点替换已经正常工作的 Torch。预编译 CUDA 库仅面向上述环境；Linux、其他 Python/PyTorch 组合需另行构建和验证。
+
+文本编码器和视频/音频 VAE 仍由原工作流与 ComfyUI 管理，不要求文本编码器固定在 CPU。主机内存、其他常驻模型及显卡剩余显存都会影响可运行范围。
+
+## 启动参数
+
+沿用 1.4.1 的默认 DynamicVRAM 配置：
+
+```text
+移除 --disable-dynamic-vram
+移除 --lowvram
+不要启用 --fast fp16_accumulation
+```
+
+修改后完整重启 ComfyUI 并重新加载模型。未启用所需的 DynamicVRAM 时，节点会给出错误提示。
+
+## 安装与升级
+
+1. 关闭 ComfyUI，将旧 `H3_V100` 文件夹备份到 `custom_nodes` 之外。
+2. 将运行包解压到 `custom_nodes`，保留完整的 `H3_V100` 文件夹及其中四个 CUDA 库。不要只替换单个 Python 文件或混用新旧库。
+3. 重启 ComfyUI 并刷新页面。从 **1.4.1 升级时，请重新添加 H3 V100 Optimize 节点并设置参数**。
+4. 用一个已有的短视频工作流确认画面和声音，再提高分辨率或时长。
+
+## 工作流连接
+
+连接方式：**模型加载 → LoRA（如有）→ H3 V100 Optimize → 采样器**。
+
+双采时，latent 放大和 Sigma Refiner 继续按原工作流连接。两段分别处理自身的采样进度与缓存，短的第二段可能不启用 SOL 或缓存跳步，这是正常保护。
+
+不要在同一模型上重复添加本节点，或叠加修改相同 H3 计算部分的加速补丁。比较不同设置时，应从 Optimize 之前分出模型分支。8 步 Turbo LoRA 的已验证采样器是 **Euler**。
 
 ## 节点参数
 
 | 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `mixed_precision` | 开 | 启用已验证的 V100 FP16/FP32 精度拆分。 |
-| `attention_backend` | `flash_attn` | 选择精确 Flash 或显式 `sol_attn`。 |
-| `sol_tau` | `1.0` | Sol 稀疏阈值，仅在 Sol 模式显示。 |
-| `sol_start_percent` | `0.2` | Sol 调度窗口起点。 |
-| `sol_end_percent` | `0.8` | Sol 调度窗口终点。 |
-
-## 启动参数迁移（重要）
-
-当前验证过的 V100 16 GiB 配置使用 ComfyUI 默认 DynamicVRAM：
-
-```text
-不要添加 --disable-dynamic-vram
-不要添加 --lowvram
-不要添加 --fast fp16_accumulation
-```
-
-如果启动命令仍含 `--disable-dynamic-vram` 或 `--lowvram`，请将它们删除，
-完整重启 ComfyUI，并重新加载扩散模型。节点会检查传入的模型是否为 Dynamic
-ModelPatcher；不是则直接报错，不会静默退回未经验证的路径。
-
-## 安装与升级
-
-1. 停止 ComfyUI。
-2. 用完整的 v1.4.1 `H3_V100` 文件夹替换旧版本；不要只覆盖单个 `.py`。
-3. 确认目录内包含
-   `comfy_v100_flash_attn_cuda.cp312-win_amd64.pyd`。
-4. 按上节清理启动参数并重启 ComfyUI。
-
-不要与其他会修改同一 H3 Attention、MLP、QKV 或 output projection 的节点
-叠加。TE-Speed 如需使用，应放在 H3 V100 之前。
-
-## 运行环境
-
-沿用的 v1.4.0 验证环境是**单张 V100**，没有将模型或 VAE 分配到第二张显卡：
-
-| 组件 | 当前验证配置 |
-|---|---|
-| GPU | 1 × NVIDIA Tesla V100 16 GiB（SM70），所有 CUDA 工作均在 `cuda:0` |
-| 模型布置 | 使用 ComfyUI 默认 DynamicVRAM 自动管理，没有手动分卡 |
-| H3 扩散模型 | MiniMax H3 INT8/混合精度权重，Dynamic VBAR 按需驻留于 `cuda:0` |
-| 文本编码器 | MiniMax H3 文本编码器在 CPU 完成编码；进入 H3 阶段后释放失活的 Dynamic 模型 |
-| 视频/音频 VAE | 由 ComfyUI 在同一张 `cuda:0` 与 CPU offload 之间管理 |
-| LoRA | MiniMax H3 FL2V Turbo 8-step BF16 |
-| 采样 | 8 步，24,792 packed tokens |
-| 软件 | Windows x64、CPython 3.12、PyTorch 2.8.0、CUDA 12.8 |
-
-运行环境需要包含当前 MiniMax H3 实现和 DynamicVRAM 的 ComfyUI。
-
-不需要额外 pip 包，也不要为安装本节点替换便携版中已经正常工作的 Torch。
-随包 `.pyd` 与 Python、Torch、CUDA ABI 相关；其他 Python 版本和 Linux 不在
-当前预编译包支持范围内。
-
-## 沿用的 v1.4.0 验证结果
-
-同一 8-step、24,792-token 工作流的本机结果：
-
-| 路线 | 状态 | 首轮 | 显示平均 | 完整任务 |
-|---|---|---:|---:|---:|
-| Flash | 冷启动 | 63.85 秒 | 54.70 秒/轮 | 563.77 秒 |
-| Flash | 热启动、稳定配置 | 54.66 秒 | 55.41 秒/轮 | 490.84 秒 |
-| Sol | 热启动、稳定配置 | 54.7 秒 | 约 54 秒/轮 | 485.69 秒 |
-
-三次均完成视频和音频输出，未观察到画面或声音异常。不同随机数、温度和频率
-状态会影响秒数。
-这些数据用于确认运行稳定性和冷/热启动差距已明显缩小，不构成跨设备性能保证。
-
-## 精确与近似路线
-
-`flash_attn` 是精确 Attention 路线。`sol_attn` 是显式选择的稀疏近似路线，
-只在满足序列长度、Block 位置和扩散阶段条件时运行；Flash 模式不会隐式进入
-Sol。对质量敏感或建立基线时优先使用 Flash。
-
-## 已知边界
-
-分辨率、时长、参考输入、音频、其他常驻模型、CUDA 碎片和 ComfyUI 版本都会
-改变显存边界。建议从 864×480 或 960×544、5–10 秒开始，再逐项增加。
-极长序列会通过更小的 MLP/QKV 分块换取可运行性，速度可能显著下降。
-
-![MiniMax H3 分辨率与时长运行区域](assets/h3-resolution-duration-vram-regions.png)
-
-| 档位 | 分辨率与时长示例 | 建议 |
 |---|---|---|
-| 推荐档 | 0.2–0.5 MP、5–10 秒；0.2–0.3 MP 可延长至 15 秒 | 清晰度、时长和生成时间较均衡。 |
-| 扩展档 | 0.4–0.6 MP、10–15 秒；0.7–0.9 MP、5–8 秒 | 通常会增加分块，耗时明显上升。 |
-| 极端档 | 约 0.9 MP、15 秒，或大多数超过 1.0 MP 的组合 | 建议先用较短时长确认显存和耗时。 |
-| 不推荐 | 1.5–2.0 MP 配合较长时长 | OOM 风险和生成时间可能不成比例。 |
+| Backend | Flash | Flash 使用精确注意力；SOL 使用稀疏加速 |
+| SOL_Quality | Quality | Quality 偏重质量；Speed 偏重速度；Ultra 更积极；Manual 手动调整 |
+| SOL_Tau | 1.0 | 仅在 SOL 的 Manual 模式显示；值越大通常越积极，需检查画面 |
+| EasyCache | Off | Off 关闭；Quality 较保守；Speed 更积极 |
+| Dual_GPU | 关闭 | 启用第二张 V100 参与计算 |
+| Dual_GPU_ID | auto | 双卡开启后显示；自动选择或指定当前进程可见的副卡 |
 
-## 参考项目与致谢
+## 如何选择加速方式
 
-- [ComfyUI](https://github.com/Comfy-Org/ComfyUI)：模型和执行框架。
-- [Sol-Attn 项目页](https://nvlabs.github.io/Sana/Sol-Attn/)与
-  [论文](https://arxiv.org/abs/2607.24027)：训练无关的在线块稀疏
-  Attention 方法参考。本节点针对 H3 与 V100/SM70 实现独立适配；Sol 是
-  显式近似路线，其他模型和硬件上的结果不代表本节点性能。
-- [Icbears/minimax-h3-v100-patch](https://github.com/Icbears/minimax-h3-v100-patch)：
-  H3 V100 混合精度拆分方案来源。本项目将修改源文件的方案改造成工作流范围
-  节点，并增加音频安全和自适应内存保护。
-- [Icbears/flash-attention-v100](https://github.com/Icbears/flash-attention-v100)：
-  SM70 Flash Attention 实现来源。
-- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) 4.2.0：原生内核构建所用
-  CUTLASS/CuTe 头文件。
-- PyTorch SDPA：正确性、性能比较和安全回退参考。
+需要建立画质基线时，使用 **Flash + EasyCache Off**。确认正常后，可切换 SOL Quality，再按画面表现尝试 Speed 或 Ultra；EasyCache 也可以单独开启或与 SOL 配合。
 
-完整署名和许可证说明见 `NOTICE.md` 和 `licenses/`。本项目整体按
-GPL-3.0-only 分发，BSD-3-Clause 组件保留原声明。
+SOL 和 EasyCache 均可能改变输出，不能保证每个场景都没有可见差异。快速运动、重复细节或音频出现变化时，先降低相关档位，或关闭缓存做对照。加速受序列长度、步数和资源状态影响，并非所有配置都会更快。
+
+双卡与双采是独立选项：单采也能用双卡，双采也能只用单卡。副卡只参与适合并行的计算，两张卡利用率和显存占用不必相同；条件不满足时会回到单卡，不承诺每一步均由双卡执行。
+
+## 双卡运行与加速参考
+
+支持双 V100 协同计算，不依赖 NVLink，也无需开启 SLI。当前通过主机内存中转数据，两张卡的显存不会直接合并。[NVIDIA 多 GPU 说明](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html)
+
+历史双 V100 16 GB 同条件测试（FP8、Flash、EasyCache 关闭、8 步、约 70K tokens）如下：
+
+| 指标 | 单卡 | 双卡 | 收益 |
+|---|---|---|---|
+| 整段总耗时 | 2241 s | 1657 s | 耗时减少约 26%，约 1.35× 速度 |
+| 采样平均每步 | 265.34 s | 180.83 s | 耗时减少约 32%，约 1.47× 速度 |
+
+这是早期开发版本的实测参考，并非 2.0 全配置性能保证。短序列或已开启 SOL/EasyCache 时，双卡收益可能较小，甚至更慢；实际效果取决于计算量、数据传输和可用资源，不承诺两倍速度。
+
+## 已通过的运行示例
+
+| 时长 | 分辨率设置 | 采样 | GPU 设置 |
+|---|---|---|---|
+| 5 秒 | 0.4 / 0.8 MP | 单采 | 单卡 |
+| 5 秒 | 2.0 MP | 单采 | 单卡 |
+| 5 秒 | 0.7 MP 放大 2 倍 | 双采 | 双卡 |
+| 15 秒 | 0.4 MP 放大 1.6 倍 | 双采 | 单卡、双卡分别通过 |
+
+MP 指百万像素，放大倍数作用于宽和高。例如 0.4 MP 放大 1.6 倍，最终约为 1.0 MP，具体尺寸受像素对齐影响。双采的资源需求应按放大后的第二段计算。
+
+上述为开发期间通过音画检查的具体案例，不是所有配置的容量保证。不同案例使用的提示词和设置不同，不用来推算相对 1.4.1 的固定加速倍数。
+
+## 使用边界
+
+首次使用可从 **0.4 MP、5 秒** 开始，再逐项增加。开发期间另有约 **1.1–1.2 MP、15 秒** 的通过记录，但接近资源边界时，运行时间可能明显增长，也仍有 OOM 的可能。
+
+实际上限取决于权重格式、LoRA、参考输入、分辨率、时长、主机内存及 ComfyUI 版本。双卡按可用资源分配，显存不等于两张卡容量直接相加。16+32 GB、32+32 GB 留有自适应支持，但尚未完成这些组合的实机验收。
+
+## 源码与致谢
+
+普通使用只需安装运行包，其中已包含预编译 CUDA 库。对应 CUDA/C++ 源码、必要头文件和构建脚本另随源码包提供，无需安装到 `custom_nodes`。发布采用 GPL-3.0-only，第三方组件保留各自许可，详见 [NOTICE.md](NOTICE.md) 和 [LICENSE](LICENSE)。
+
+感谢 [ComfyUI](https://github.com/Comfy-Org/ComfyUI)、[MiniMax H3 V100 Patch](https://github.com/Icbears/minimax-h3-v100-patch)、[FlashAttention V100](https://github.com/Icbears/flash-attention-v100)、[Sol-Attn](https://nvlabs.github.io/Sana/Sol-Attn/)、[EasyCache](https://github.com/H-EmbodVis/EasyCache) 和 [CUTLASS](https://github.com/NVIDIA/cutlass)。

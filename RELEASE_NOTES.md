@@ -1,48 +1,14 @@
-# H3 V100 v1.4.1 更新说明
+# H3 V100 v2.0.0 更新说明
 
-## 修复
+相对上一公开版 **v1.4.1**，本版将更多加速功能整合到同一个主节点中。
 
-- 修复连续运行第二次或第三次时，文本编码阶段可能出现
-  `hostbuf_read_file_slice: device copy failed result=2` 并导致 ComfyUI
-  进程直接退出的问题。
-- 下一轮加载文本编码器前，会清理已经完成的预取队列，并释放本节点上一轮留下的
-  H3 DynamicVRAM 驻留。该逻辑只作用于本节点标记的 H3 模型，不改变其他模型的
-  DynamicVRAM 行为。
+- **新增双卡支持**：可自动选择或指定第二张 V100，Flash 和 SOL 均可配合双卡运行。
+- **新增 FP8 适配**：支持 scaled FP8 E4M3 UNet，并保留 INT8 ConvRot 支持。
+- **升级 SOL**：提供 Quality、Speed、Ultra 和 Manual 档位，便于选择质量与速度。
+- **集成 EasyCache**：提供 Off、Quality、Speed，分别保护视频与音频。
+- **完善双采支持**：改善两段采样、latent 放大和 Sigma Refiner 的配合。
+- **优化显存与稳定性**：改善长序列、连续运行及阶段切换的资源协调，保留显存不足时的保护。
 
-## 主要更新
+升级请完整替换旧文件夹，重启 ComfyUI，并重新添加 Optimize 节点。继续使用默认 DynamicVRAM；8 步 Turbo LoRA 使用已验证的 **Euler**。建议先用已有短视频工作流确认音画。
 
-- 适配 ComfyUI 默认 DynamicVRAM，由 ComfyUI VBAR 管理压缩权重驻留。
-- H3 开始采样前自动释放已经失活的前阶段 CUDA Dynamic 模型，为单卡采样腾出
-  显存。
-- MLP 在一次调用内只准备一次 fc1/fc2 权重，并供全部 activation chunks
-  复用，明显缩小冷启动与热启动的耗时差距。
-- 固定启用经过验证的 scaled FP16 SwiGLU、自适应 MLP 分块和超长序列投影
-  分块。
-- 保留精确 `flash_attn` 与显式 `sol_attn` 两条路线；Flash 不会隐式进入 Sol。
-
-## 启动参数
-
-请从 ComfyUI 启动命令中删除：
-
-```text
---disable-dynamic-vram
---lowvram
-```
-
-V100 不建议启用全局 `--fast fp16_accumulation`。修改启动命令后需要完整重启
-ComfyUI，并重新加载扩散模型。
-
-## 验证环境与结果
-
-当前测试使用单张 NVIDIA Tesla V100 16 GiB。所有 CUDA 工作均在 `cuda:0`；
-H3 与视频/音频 VAE 由 ComfyUI DynamicVRAM 和 CPU offload 管理，文本编码器
-在 CPU 运行，没有进行多卡模型分配。
-
-| 路线 | 状态 | 首轮 | 显示平均 | 完整任务 |
-|---|---|---:|---:|---:|
-| Flash | 冷启动 | 63.85 秒 | 54.70 秒/轮 | 563.77 秒 |
-| Flash | 热启动 | 54.66 秒 | 55.41 秒/轮 | 490.84 秒 |
-| Sol | 热启动 | 54.7 秒 | 约 54 秒/轮 | 485.69 秒 |
-
-以上运行均正常生成画面和声音；耗时用于说明当前环境下的运行状态，不作为跨设备
-性能保证。
+使用方法与运行示例见 [中文说明](README_zh-CN.md) / [English](README.md)。
