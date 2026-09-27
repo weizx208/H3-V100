@@ -36,7 +36,7 @@ def install():
         try:
             strict = _build(original)
         except (OSError, TypeError, SyntaxError, RuntimeError) as error:
-            failure = str(error)
+            failure = type(error).__name__
 
         @functools.wraps(original)
         def dispatch(*args, **kwargs):

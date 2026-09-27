@@ -48,12 +48,14 @@ class HostStagingPlan:
 def _reserve(memory: DeviceMemory) -> int:
     return max(256 * MIB, int(memory.total_bytes * 0.06))
 
-def _best_partition(total_units: int, unit_alignment: int, primary: DeviceMemory, secondary: DeviceMemory, primary_fixed: int, secondary_fixed: int, primary_per_unit: int, secondary_per_unit: int, *, minimum_units: int, primary_preparation: tuple[int, int] | None=None) -> ParallelPlan:
+def _best_partition(total_units: int, unit_alignment: int, primary: DeviceMemory, secondary: DeviceMemory, primary_fixed: int, secondary_fixed: int, primary_per_unit: int, secondary_per_unit: int, *, minimum_units: int, primary_preparation: tuple[int, int] | None=None, fixed_primary_units=None) -> ParallelPlan:
     primary_reserve = _reserve(primary)
     secondary_reserve = _reserve(secondary)
     candidates = []
     rejected = []
     for primary_units in range(minimum_units, total_units - minimum_units + 1, unit_alignment):
+        if fixed_primary_units is not None and primary_units != fixed_primary_units:
+            continue
         secondary_units = total_units - primary_units
         if secondary_units < minimum_units or secondary_units % unit_alignment:
             continue
@@ -79,7 +81,7 @@ def _best_partition(total_units: int, unit_alignment: int, primary: DeviceMemory
     best = min(candidates)
     return ParallelPlan(True, best[4], best[5], best[6], best[7], primary_reserve, secondary_reserve, best[8], best[9], 'balanced-live-capacity' if best[4] == best[5] else 'capacity-shifted')
 
-def plan_attention_heads(tokens: int, query_chunk: int, primary: DeviceMemory, secondary: DeviceMemory, *, heads: int=56, head_dim: int=128, hidden: int=5376, sol_route: bool=False, pipeline_slots: int=2, minimum_heads: int=19, rope_table_elements_per_token: int=192, audio_rows: int=0, audio_key_chunk: int=1024, audio_query_chunk: int=512, primary_decode_extra_bytes: int=0) -> ParallelPlan:
+def plan_attention_heads(tokens: int, query_chunk: int, primary: DeviceMemory, secondary: DeviceMemory, *, heads: int=56, head_dim: int=128, hidden: int=5376, sol_route: bool=False, pipeline_slots: int=2, minimum_heads: int=19, rope_table_elements_per_token: int=192, audio_rows: int=0, audio_key_chunk: int=1024, audio_query_chunk: int=512, primary_decode_extra_bytes: int=0, fixed_primary_heads=None, primary_qkv_preallocated=False) -> ParallelPlan:
     """Plan a head split from current memory rather than nominal card size."""
     if tokens <= 0 or query_chunk <= 0:
         raise ValueError('tokens and query_chunk must be positive')
@@ -91,6 +93,8 @@ def plan_attention_heads(tokens: int, query_chunk: int, primary: DeviceMemory, s
         raise ValueError('invalid audio geometry')
     if not 1 <= minimum_heads <= heads // 2:
         raise ValueError('minimum_heads must fit on both devices')
+    if fixed_primary_heads is not None and not minimum_heads <= fixed_primary_heads <= heads - minimum_heads:
+        raise ValueError('fixed primary heads do not fit the partition')
     if primary_decode_extra_bytes < 0:
         raise ValueError('primary decode workspace must be nonnegative')
     pipeline_slots = max(1, int(pipeline_slots))
@@ -131,9 +135,11 @@ def plan_attention_heads(tokens: int, query_chunk: int, primary: DeviceMemory, s
         # full-sequence QKV. Require BOTH phase envelopes to fit. Keep
         # compressed-page charges, INT8 decode extra, and all reserves
         # in both envelopes; SOL genuinely overlaps these allocations.
-        primary_preparation = (primary_fixed, primary_per_head - qkv_per_head)
-        primary_fixed -= heads * qkv_weight_per_head
-    return _best_partition(heads, 1, primary, secondary, primary_fixed, secondary_fixed, primary_per_head, secondary_per_head, minimum_units=minimum_heads, primary_preparation=primary_preparation)
+        if not primary_qkv_preallocated:
+            primary_preparation = (primary_fixed, primary_per_head - qkv_per_head)
+            primary_fixed -= heads * qkv_weight_per_head
+        # Acquired QKV stays live during weight preparation: retain that overlap.
+    return _best_partition(heads, 1, primary, secondary, primary_fixed, secondary_fixed, primary_per_head, secondary_per_head, minimum_units=minimum_heads, primary_preparation=primary_preparation, fixed_primary_units=fixed_primary_heads)
 
 def plan_mlp_channels(tokens: int, chunk_tokens: int, primary: DeviceMemory, secondary: DeviceMemory, *, intermediate: int=14336, hidden: int=5376, alignment: int=256, pipeline_slots: int=3, minimum_channels: int=5376) -> ParallelPlan:
     """Plan SwiGLU intermediate channels with FP8 storage and FP16 compute."""

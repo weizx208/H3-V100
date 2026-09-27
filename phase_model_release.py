@@ -80,7 +80,7 @@ def _release_dynamic_gpu_keep_unregistered_host(model, model_management):
         if retained_ram != ram_before:
             raise RuntimeError(f'host-cache size changed during unregister-only release: {ram_before} -> {retained_ram} bytes')
     except Exception as error:
-        LOGGER.warning('H3 host-cache phase release failed; falling back to full detach: %s: %s', type(error).__name__, error)
+        LOGGER.warning('H3 host-cache phase release failed; falling back to full detach: %s', type(error).__name__)
         model_management.unload_model_and_clones(model, unload_additional_models=False, all_devices=True)
 
 def _release_prior_stage_full_detach(model, model_management):

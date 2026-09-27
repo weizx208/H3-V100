@@ -29,4 +29,7 @@ def select(original_bound):
     function = getattr(original_bound, '__func__', None)
     if function is None:
         return None
+    from .residual_lifetime import MARKER as root_marker
+    if getattr(function, root_marker, False):
+        return function
     return build(function)

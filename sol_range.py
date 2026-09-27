@@ -48,7 +48,7 @@ class CorrectedSolRangeStream:
         if self._exact_fallback is None:
             if isinstance(error, BaseException):
                 raise RuntimeError('corrected Sol range stream has no exact fallback') from error
-            raise RuntimeError(f'corrected Sol range stream has no exact fallback: {error}')
+            raise RuntimeError('corrected Sol range stream has no exact fallback')
         return self._exact_fallback()
 
     def __iter__(self):

@@ -447,7 +447,7 @@ def _make_override(state, stable_override):
 
                     def exact_timing_complete(exact_ms, timing_error):
                         if timing_error is not None or exact_ms is None:
-                            admission.update({'status': 'failed', 'admitted': False, 'reason': f'bounded-exact-timing-{type(timing_error).__name__}: {timing_error}'})
+                            admission.update({'status': 'failed', 'admitted': False, 'reason': f'bounded-exact-timing-{type(timing_error).__name__}'})
                             LOGGER.warning('H3 V100 bounded Sol calibration failed open: %s', admission['reason'])
                             return
                         ratio = float(candidate_ms) / max(float(exact_ms), 1e-06)
@@ -461,15 +461,21 @@ def _make_override(state, stable_override):
             except Exception as error:
                 if _fatal_device_failure(error):
                     raise
-                admission.update({'status': 'failed', 'admitted': False, 'reason': f'{type(error).__name__}: {error}'})
+                admission.update({'status': 'failed', 'admitted': False, 'reason': type(error).__name__})
                 LOGGER.warning('H3 V100 fused Sol calibration failed open to Flash: %s', admission['reason'])
             warm_output = candidate = exact = attach_timing = None
             _release_adaptive_route_history(route_policy)
             _cleanup_rejected_calibration(q.device)
             return exact_call()
-        if _sol_window_phase(state, transformer_options) == 'speed-precalibration':
-            return exact_call()
         if int(state.current_step) == int(admission.get('calibration_step', -1)):
+            if admission.get('cache_hit', False) and int(block_index) in CALIBRATION_LAYERS:
+                # A cache hit skips timing, not the cold calibration's exact
+                # math path. Otherwise warm runs can switch full Flash to
+                # bounded dense attention at these layers under pressure.
+                bounded = bool(admission.get('stream_output', False))
+                return exact_call(range_allowed=bounded, range_required=bounded)
+            return exact_call()
+        if _sol_window_phase(state, transformer_options) == 'speed-precalibration':
             return exact_call()
         if not admission.get('admitted', False):
             return exact_call()
@@ -480,21 +486,15 @@ def _make_override(state, stable_override):
 
                 def mark_stream_failure(error):
                     _release_adaptive_route_history(route_policy)
-                    if isinstance(error, tuple) and len(error) == 2:
-                        error_type, error_text = error
-                    elif error is None:
-                        error_type, error_text = ('StreamFailure', 'unknown')
-                    else:
-                        error_type, error_text = (type(error).__name__, str(error))
                     admission['admitted'] = False
-                    admission['reason'] = f'runtime-{error_type}: {error_text}'
+                    admission['reason'] = f'runtime-{type(error).__name__}' if not isinstance(error, tuple) else 'runtime-StreamFailure'
                     LOGGER.warning('H3 V100 corrected Sol range stream failed open to Flash: %s', admission['reason'])
                 output.attach_fallback(lambda: make_exact_flash_range_stream(q, k, v, scale=kwargs.get('scale'), chunk_tokens=CORRECTED_STREAM_CHUNK_TOKENS, audio_ranges=audio_ranges, audio_overwrite_active=audio_overwrite_active), mark_stream_failure)
             return output
         except Exception as error:
             if _fatal_device_failure(error):
                 raise
-            admission.update({'admitted': False, 'reason': f'runtime-{type(error).__name__}: {error}'})
+            admission.update({'admitted': False, 'reason': f'runtime-{type(error).__name__}'})
             LOGGER.warning('H3 V100 fused Sol runtime failed open to Flash: %s', admission['reason'])
         output = None
         _release_adaptive_route_history(route_policy)

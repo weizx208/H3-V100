@@ -93,7 +93,8 @@ class H3RuntimePrefetchGuard:
         existing = patched.object_patches.get(key)
         if existing is not None:
             function = getattr(existing, '__func__', existing)
-            if not getattr(function, PATCH_MARKER, False):
+            from .residual_lifetime import MARKER as root_marker
+            if not (getattr(function, PATCH_MARKER, False) or getattr(function, root_marker, False)):
                 raise RuntimeError(f'H3 runtime guard found another patch at {key}.')
             base_forward = _unwrap_our_forward(existing)
         else:

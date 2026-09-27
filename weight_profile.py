@@ -25,10 +25,20 @@ def detect_h3_weight_profile(diffusion_model) -> str:
     for block_index, owner_name, projection_name, projection in _projection_modules(diffusion_model):
         path = f'blocks.{block_index}.{owner_name}.{projection_name}'
         quant_format = getattr(projection, 'quant_format', None)
+        if quant_format not in ('float8_e4m3fn', 'int8_tensorwise'):
+            raise RuntimeError(
+                f'H3 V100 does not support the core-weight format at {path}: '
+                f'quant_format={quant_format!r}. Use a scaled FP8 E4M3 or native '
+                'INT8 ConvRot group-256 H3 model; GGUF/Q4_K is not supported.'
+            )
         formats.add(quant_format)
         params = getattr(getattr(projection, 'weight', None), '_params', None)
         if params is None or getattr(params, 'scale', None) is None:
-            raise RuntimeError(f'H3 V100 compressed-weight admission found no scale for {path}.')
+            raise RuntimeError(
+                f'H3 V100 {quant_format} core weight at {path} has no required '
+                'scale metadata. Check the checkpoint and loader; do not fabricate '
+                'a scale or bypass weight-profile validation.'
+            )
         if getattr(projection, 'pre_quant_scale', None) is not None:
             raise RuntimeError(f'H3 V100 does not support pre_quant_scale on prepared-weight projections: {path}.')
         projections.append((path, params))

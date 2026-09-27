@@ -14,6 +14,7 @@ const LABELS = {attention_backend: "Backend", sol_quality_profile: "SOL_Quality"
     sol_tau: "SOL_Tau", easycache_mode: "EasyCache", dual_gpu: "Dual_GPU",
     dual_gpu_secondary: "Dual_GPU_ID"};
 const PRESETS = {quality: 1.0, speed: 2.0, ultra: 2.5};
+const NODE = "H3V100Optimize";
 const backend = value => ({flash_attn: "Flash", sol_attn: "SOL"})[value] ?? value;
 const cacheMode = (value, profile) => {
     if (["Off", "Quality", "Speed"].includes(value)) return value;
@@ -53,7 +54,7 @@ function hide(widget, hidden) {
 app.registerExtension({
     name: "H3.V100.Controls",
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "H3V100Optimize") return;
+        if (nodeData.name !== NODE) return;
         const configure = nodeType.prototype.configure;
         nodeType.prototype.configure = function(info, ...args) {
             const result = configure.call(this, migrate(info), ...args);
@@ -62,7 +63,7 @@ app.registerExtension({
         };
     },
     nodeCreated(node) {
-        if (node.comfyClass !== "H3V100Optimize") return;
+        if (node.comfyClass !== NODE) return;
         const widget = name => node.widgets?.find(item => item.name === name);
         node._h3UpdateControls = () => {
             for (const [name, label] of Object.entries(LABELS)) {

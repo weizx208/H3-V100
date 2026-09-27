@@ -1,5 +1,34 @@
 # Changelog
 
+## v2.0.2
+
+Changes since v2.0.0.
+
+- After a recoverable dual-attention execution resource failure, rebuild the
+  input and complete the block on one GPU before allowing fresh dual admission
+  later in the same sample. Allow at most two such recovery opportunities per
+  device pair, shape and route per sample; preserve all capacity checks.
+- Propagate fatal CUDA errors found during cleanup after releasing the run
+  lock. Preserve ordinary recovery, cancellation and the original fatal error.
+- Record larger successful workflows and the observed process-abort boundary
+  without promising a universal sequence limit or guaranteed OOM recovery.
+
+- Improve WDDM long-sequence dual-GPU head balance using live capacity and
+  reusable QKV workspace. Preserve peak-memory reserves, host-pool checks and
+  safe single-GPU fallback; capacity fallback warnings are rate-limited.
+- Support cudaMallocAsync without disabling ComfyUI's allocation graph:
+  secondary allocations, execution and cleanup share one owning worker;
+  cross-block FP32 residuals use the model-root lifetime.
+- Improve repeated-run and exception cleanup, including retained EasyCache
+  predictions before sampler graph teardown. Preserve SOL calibration routing.
+- Fix preset SOL Tau values (Quality 1.0, Speed 2.0, Ultra 2.5); show the editable
+  Tau control only in Manual, with legacy workflow migration retained.
+- Remove development timing collection and verbose planning logs from the
+  installed node; clarify DynamicVRAM and unsupported core-weight errors.
+- Retain the single public node, v2.0.0 model formats, audio precision and four
+  native CUDA libraries. Consecutive full videos passed picture/audio acceptance;
+  independent tests also passed cancellation/recovery in the tested conditions.
+
 ## v2.0.0
 
 - Added dual-V100 execution for Flash and SOL, with automatic or explicit secondary-GPU selection.

@@ -1,5 +1,4 @@
 """Validated MiniMax H3 optimization profile for NVIDIA V100 / SM70."""
-import logging
 import torch
 from .native_dynamic_vbar import NativeDynamicVBARPolicy, CONTROLLER_KEY
 from .weight_profile import FP8_E4M3_PROFILE, INT8_CONVROT_PROFILE, WEIGHT_PROFILE_OPTION_KEY, detect_h3_weight_profile
@@ -13,7 +12,6 @@ from .fused_sol_speed import patch_model_for_fused_sol_speed
 from .sol_adaptive_policy import POLICY_KEY as ADAPTIVE_POLICY_KEY, install_adaptive_budget
 from .h3_easycache import MODE_OFF as EASYCACHE_OFF, SUPPORTED_MODES as EASYCACHE_MODES, patch_model_for_h3_easycache
 from .runtime_memory import install_runtime_memory_policy, patch_model_for_runtime_memory_lifecycle
-LOGGER = logging.getLogger('H3V100Optimize')
 SOURCE_MODEL_FINGERPRINT_KEY = 'v100_h3_source_model_fingerprint'
 FLASH_MIN_TOKENS = 1024
 SOL_SPEED_MIN_TOKENS = 16384
@@ -26,6 +24,7 @@ ULTRA_PROFILE = 'ultra'
 MANUAL_PROFILE = 'manual'
 QUALITY_PROFILES = (QUALITY_PROFILE, SPEED_PROFILE, MANUAL_PROFILE)
 SOL_QUALITY_PROFILES = (QUALITY_PROFILE, SPEED_PROFILE, ULTRA_PROFILE, MANUAL_PROFILE)
+SOL_QUALITY_TAU = 1.0
 SOL_SPEED_TAU = 2.0
 SOL_ULTRA_TAU = 2.5
 EASYCACHE_QUALITY_VIDEO_THRESHOLD = 0.15
@@ -71,15 +70,42 @@ def _force_dynamic_projection_casts(model):
             patched.add_object_patch(f'diffusion_model.blocks.{index}.{owner}.{projection}.comfy_force_cast_weights', True)
     return patched
 
+def _require_dynamic_model(model):
+    """Reject legacy patchers before installing DynamicVRAM-only policies."""
+    is_dynamic = getattr(model, 'is_dynamic', None)
+    if not callable(is_dynamic) or not bool(is_dynamic()):
+        raise RuntimeError(
+            'H3 V100 requires a ComfyUI DynamicVRAM ModelPatcher for this MODEL. '
+            'The supplied model reports is_dynamic()=False. Check the startup log for '
+            '"DynamicVRAM support detected and enabled", use a compatible ComfyUI/'
+            'comfy-aimdo installation and model loader, remove --disable-dynamic-vram '
+            'and --lowvram, then restart and reload the model. --disable-cuda-malloc '
+            'is independent and may remain enabled on V100. Do not bypass this check.'
+        )
+
+def _require_wddm_dual_allocator():
+    """Require Comfy's graph hook for cudaMallocAsync dual-GPU isolation."""
+    backend = torch.cuda.get_allocator_backend()
+    if str(backend).lower() == 'cudamallocasync':
+        try:
+            import comfy.model_prefetch as model_prefetch
+        except ImportError as error:
+            raise RuntimeError('H3 V100 dual GPU with cudaMallocAsync requires ComfyUI model_prefetch graph control.') from error
+        if not callable(getattr(model_prefetch, 'malloc_graph_enabled', None)):
+            raise RuntimeError('H3 V100 dual GPU with cudaMallocAsync requires ComfyUI malloc_graph_enabled().')
+
 def _resolve_sol_profile(profile, *, tau, start_percent, end_percent):
     """Resolve Sol controls without changing serialized expert workflows."""
     if profile not in SOL_QUALITY_PROFILES:
         raise ValueError(f'sol_quality_profile must be one of {SOL_QUALITY_PROFILES!r}.')
-    resolved_tau = float(tau)
-    if profile == SPEED_PROFILE:
-        resolved_tau = max(resolved_tau, SOL_SPEED_TAU)
+    if profile == QUALITY_PROFILE:
+        resolved_tau = SOL_QUALITY_TAU
+    elif profile == SPEED_PROFILE:
+        resolved_tau = SOL_SPEED_TAU
     elif profile == ULTRA_PROFILE:
-        resolved_tau = max(resolved_tau, SOL_ULTRA_TAU)
+        resolved_tau = SOL_ULTRA_TAU
+    else:
+        resolved_tau = float(tau)
     return (resolved_tau, float(start_percent), float(end_percent))
 
 def _resolve_easycache_profile(profile, *, video_threshold, video_frame_p95_threshold, audio_threshold):
@@ -121,11 +147,8 @@ class H3V100Optimize:
         easycache_mode = _enabled_easycache(easycache_mode)
         if CONTROLLER_KEY in model.model_options.get('transformer_options', {}):
             raise RuntimeError('H3 V100 Optimize is already installed on this MODEL. Use one Optimize node per model branch; connect its output to both samplers for split sampling. To compare settings, branch from the model before Optimize.')
-        if not bool(mixed_precision):
-            LOGGER.warning('H3 V100 Optimize ignored legacy mixed_precision=False; the validated stable precision contract is always enabled.')
-        mixed_precision = True
-        if cold_start_prefetch != 'off':
-            LOGGER.warning('H3 ignored retired cold_start_prefetch=%r; using the validated native demand path.', cold_start_prefetch)
+        # Retired keyword arguments remain accepted for old API workflows but
+        # have no runtime branch. The validated precision and demand path are fixed.
         if attention_backend not in (MODE_FLASH, MODE_SOL):
             raise ValueError(f'attention_backend must be {MODE_FLASH!r} or {MODE_SOL!r}; received {attention_backend!r}.')
         fp16_mlp = True
@@ -155,6 +178,7 @@ class H3V100Optimize:
             raise RuntimeError(f'H3 V100 Optimize accepts only the validated MiniMax H3 model; received {model_type.__module__}.{model_type.__name__}.')
         weight_profile = detect_h3_weight_profile(diffusion_model)
         if bool(dual_gpu):
+            _require_wddm_dual_allocator()
             choices = _dual_gpu_secondary_options()
             if len(choices) <= 1:
                 raise RuntimeError('Dual GPU requires another visible V100/SM70 device in the current ComfyUI process.')
@@ -163,9 +187,7 @@ class H3V100Optimize:
             if weight_profile not in (FP8_E4M3_PROFILE, INT8_CONVROT_PROFILE):
                 raise RuntimeError(f'Dual GPU requires a validated FP8 E4M3 scaled or INT8-ConvRot H3 core; received {weight_profile!r}.')
         configured = model.clone()
-        is_dynamic = getattr(configured, 'is_dynamic', None)
-        if not callable(is_dynamic) or not bool(is_dynamic()):
-            raise RuntimeError('H3 V100 requires ComfyUI DynamicVRAM. Remove --disable-dynamic-vram and --lowvram, restart ComfyUI, and reload the model.')
+        _require_dynamic_model(configured)
         configured.set_model_compute_dtype(torch.float16)
         configured = _force_dynamic_projection_casts(configured)
         configured_options = configured.model_options.setdefault('transformer_options', {})

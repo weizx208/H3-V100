@@ -1,10 +1,10 @@
-# H3 V100 Optimize 2.0
+# H3 V100 Optimize 2.0.2
 
 [简体中文](README_zh-CN.md) | English
 
 A MiniMax H3 acceleration node for ComfyUI on NVIDIA V100. One node combines model optimization, Flash / SOL attention, EasyCache, and optional dual-GPU execution.
 
-Building on v1.4.1's mixed-precision acceleration, automatic memory management, and repeated-run safeguards, 2.0 expands model-format and workflow support. It operates on the supplied MODEL branch without rewriting ComfyUI or other nodes' source files. Only supported MiniMax H3 architectures are covered.
+2.0.2 builds on 2.0.0 with improved WDDM long-sequence dual-GPU scheduling, repeated-run and resource-error recovery, and corrected SOL preset controls. The node acts on its input MODEL branch and does not rewrite ComfyUI or other nodes; it supports compatible MiniMax H3 model structures only.
 
 ## Demo
 
@@ -22,7 +22,7 @@ Building on v1.4.1's mixed-precision acceleration, automatic memory management, 
 - **EasyCache**: Off, Quality, and Speed, with separate video and audio safeguards.
 - **Improved two-stage sampling**, including latent upscaling and Sigma Refiner workflows.
 
-Core compute and memory policies apply automatically; no separate memory-management node is required. See [release notes](RELEASE_NOTES.md) for changes from v1.4.1.
+Core compute and memory policies apply automatically; no separate memory-management node is required. See [release notes](RELEASE_NOTES.md) for the complete changes since v2.0.0.
 
 ## Requirements
 
@@ -40,7 +40,7 @@ The text encoder and video/audio VAEs remain managed by ComfyUI and the workflow
 
 ## Launch options
 
-Keep ComfyUI's default DynamicVRAM configuration, as in v1.4.1:
+Keep the working DynamicVRAM configuration:
 
 ```text
 Remove --disable-dynamic-vram
@@ -50,11 +50,17 @@ Do not enable --fast fp16_accumulation
 
 Fully restart ComfyUI and reload the model after changing these options. The node reports an error if the required DynamicVRAM configuration is unavailable.
 
+WDDM dual-GPU mode supports the native allocator (`--disable-cuda-malloc`) and `cudaMallocAsync` in the validated environment. Keep your working allocator setting; the flag does not disable DynamicVRAM. The async path keeps ComfyUI's allocation graph enabled and has passed consecutive full-video runs with picture/audio acceptance, plus an independent cancellation/recovery test. These tests do not guarantee every ComfyUI version or hardware combination.
+
+If the node reports `is_dynamic()=False`, check for `DynamicVRAM support detected and enabled` in the startup log and verify that ComfyUI, comfy-aimdo, and the model loader actually provide a DynamicVRAM ModelPatcher. Do not bypass that guard: a legacy patcher producing a video does not validate this node's dynamic weight and memory path.
+
+For a core-weight-format error, check the model loader's log. This node accepts native INT8 ConvRot (group size 256) or scaled FP8 E4M3 H3 core weights only. `gguf qtypes: ... Q4_K` identifies an unsupported GGUF model, not a missing scale file; fabricating a scale or bypassing the check will not make it compatible.
+
 ## Installation and upgrade
 
 1. Close ComfyUI. Back up and move the old `custom_nodes/H3_V100` folder elsewhere.
 2. Extract the runtime package into `custom_nodes`, keeping the complete `H3_V100` folder and its four CUDA libraries. Do not replace individual Python files or mix old and new libraries.
-3. Restart ComfyUI and refresh the page. **When upgrading from v1.4.1, add a fresh H3 V100 Optimize node and configure it again.**
+3. Restart ComfyUI and refresh the page. Existing v2.0.x workflows can keep their node; when upgrading from v1.4.1, add and configure a fresh H3 V100 Optimize node.
 4. Check video and audio using an existing short-video workflow before increasing resolution or duration.
 
 ## Workflow connections
@@ -84,18 +90,11 @@ SOL and EasyCache can change outputs; visible differences depend on the scene. I
 
 Dual GPU and two-stage sampling are independent options. The secondary GPU handles eligible parallel work, so unequal utilization and VRAM use are normal. Execution falls back to one GPU when conditions are unsuitable; dual-GPU participation is not guaranteed at every step.
 
-## Dual-GPU operation and performance
+## Dual-GPU operation
 
 Supports computation across two V100 GPUs without requiring NVLink or enabling SLI. The current implementation stages transfers through host memory; the cards' VRAM is not combined into a single pool. [NVIDIA multi-GPU documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html)
 
-A historical matched test on two 16 GB V100s used FP8, Flash, EasyCache Off, 8 steps, and approximately 70K tokens:
-
-| Metric | Single GPU | Dual GPU | Benefit |
-|---|---|---|---|
-| Total execution time | 2241 s | 1657 s | About 26% less time; 1.35× speed |
-| Average sampling step | 265.34 s | 180.83 s | About 32% less time; 1.47× speed |
-
-These measurements come from an earlier development version, not a performance guarantee for all 2.0 configurations. Short sequences or SOL/EasyCache workloads may gain less or run slower. Results depend on computation, transfers, and available resources; a 2× speedup is not promised.
+Short sequences or SOL/EasyCache workloads may gain less or run slower. Results depend on computation, transfers, and available resources; a 2× speedup is not promised. This long-sequence scheduling update was validated under WDDM; TCC/NVLink performance is outside the v2.0.2 claim.
 
 ## Validated examples
 
@@ -108,11 +107,19 @@ These measurements come from an earlier development version, not a performance g
 
 MP means megapixels; upscaling multiplies both width and height. For example, 0.4 MP upscaled 1.6× becomes approximately 1.0 MP, subject to dimension alignment. Plan two-stage sampling resources around the final resolution.
 
-These development cases passed video/audio checks, but do not guarantee capacity for every configuration. Their prompts and settings differ, so they do not establish a fixed speedup over v1.4.1.
+These cases passed video/audio checks, but do not guarantee capacity for every configuration. Their prompts and settings differ, so they do not establish a fixed speedup over v2.0.0.
+
+## Recovery after resource errors
+
+After a recoverable dual-attention execution resource failure, the node rebuilds the input and completes the current block on one GPU before allowing fresh dual admission later in the same sample. Each device pair, shape and route has at most two recovery opportunities per sample. Capacity checks still apply; single-GPU execution may also fail for lack of resources. The budget resets for the next sample. Fatal CUDA errors and native process aborts cannot be guaranteed recoverable within the process.
 
 ## Practical limits
 
 Start with **0.4 MP, 5 seconds**, then increase one setting at a time. Development tests also passed at approximately **1.1–1.2 MP, 15 seconds**, but execution can become much slower near resource limits and may still run out of memory.
+
+Additional user tests completed 7+2-step workflows at 2560x1472 in 27:16 and 2752x1536 in 33:19. For latent T=37, batch one and the current patch layout, the video-only estimates are 136,160 and 152,736 tokens; text, audio and other inputs are additional. The earlier 1.2 MP, 15-second case logged 135,718 total packed tokens. These are observed cases, not fixed capacity limits.
+
+The same stress test at 3008x1664 aborted the process during second-stage single-GPU QKV allocation after dual admission was rejected, requiring a ComfyUI restart. This case did not pass. The two successful logs do not show the execution-OOM recovery branch being triggered, so they do not establish real-GPU OOM recovery validation.
 
 Capacity depends on weight format, LoRA, reference inputs, resolution, duration, host RAM, and ComfyUI version. Dual-GPU allocation uses available resources; VRAM capacity is not simply the sum of both cards. Adaptive support allows for 16+32 GB and 32+32 GB configurations, but these combinations have not completed hardware validation.
 

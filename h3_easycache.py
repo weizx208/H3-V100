@@ -603,7 +603,14 @@ def h3_easycache_diffusion_wrapper(executor, *args, **kwargs):
     state = None if options is None else options.get(STATE_KEY)
     if not isinstance(state, H3EasyCacheState):
         return executor(*args, **kwargs)
-    return state.execute(executor, args, kwargs, options)
+    try:
+        return state.execute(executor, args, kwargs, options)
+    except BaseException:
+        # Cancellation also derives directly from BaseException. Drop retained
+        # prediction tensors before sampler teardown can abort/destroy their
+        # allocation graph; OUTER_SAMPLE remains the final idempotent cleanup.
+        state.clear_runtime()
+        raise
 
 def h3_easycache_outer_sample_wrapper(executor, *args, **kwargs):
     import comfy.model_patcher

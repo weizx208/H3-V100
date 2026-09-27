@@ -77,7 +77,7 @@ class ExactFlashRangeStream:
         if self._runtime_failure is not None:
             self._runtime_failure(error)
         if self._fallback is None:
-            raise RuntimeError(f'exact Flash range stream exhausted its fallback: {error}')
+            raise RuntimeError('exact Flash range stream exhausted its fallback')
         return self._fallback()
 
     def __iter__(self):

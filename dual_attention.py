@@ -24,6 +24,11 @@ BLOCK_PATCH_MARKER = '_h3_v100_dual_exact_block'
 SELECTED_BACKEND_KEY = 'v100_h3_selected_attention_backend'
 LIFECYCLE_WRAPPER_KEY = 'v100_h3_dual_attention_lifecycle'
 ADAPTIVE_BUDGET_POLICY_KEY = 'v100_h3_sol_adaptive_budget_policy'
+WDDM_REBALANCE_MIN_TOKENS = 65536
+WDDM_REBALANCE_MIN_HEAD_GAIN = 4
+WDDM_REBALANCE_MIN_RECLAIMABLE_MIB = 512
+WDDM_LEASE_MIN_DRIVER_FREE_MIB = 512
+RESOURCE_REPROBES_PER_SAMPLE = 2
 _DUAL_RUN_LOCK = threading.Lock()
 from .dual_runtime import _fatal_device_failure
 
@@ -113,13 +118,14 @@ def out_head_columns(weight, start_head, stop_head, heads, head_dim):
 class DualAttentionRetry(RuntimeError):
     """Tell the enclosing block to rebuild its disposable AdaLN input."""
 
-    def __init__(self, failure_type, failure_message, *, partial_target_write, fallback, devices):
+    def __init__(self, failure_type, failure_message, *, partial_target_write, fallback, devices, on_recovery=None):
         super().__init__(f'{failure_type}: {failure_message}')
         self.failure_type = str(failure_type)
         self.failure_message = str(failure_message)
         self.partial_target_write = bool(partial_target_write)
         self.fallback = fallback
         self.devices = tuple((int(value) for value in devices))
+        self.on_recovery = on_recovery
 
 class _DualAdmissionFallback(RuntimeError):
     """Leave the dual transaction before invoking the single-device path."""
@@ -252,14 +258,19 @@ def _local_qkv_chunk(attention, value, qkv_weight, q_weight, k_weight, rope, loc
     del source, projected
     return (q, k, v)
 
-def _local_qkv(attention, value, qkv_weight, q_weight, k_weight, rope, local_heads, query_chunk, *, already_scaled):
+def _local_qkv(attention, value, qkv_weight, q_weight, k_weight, rope, local_heads, query_chunk, *, already_scaled, outputs=None):
     device = qkv_weight.device
     torch.cuda.set_device(device)
     tokens = int(value.shape[0])
     head_dim = int(attention.head_dim)
-    q_out = torch.empty((1, local_heads, tokens, head_dim), dtype=torch.float16, device=device)
-    k_out = torch.empty_like(q_out)
-    v_out = torch.empty_like(q_out)
+    if outputs is None:
+        q_out = torch.empty((1, local_heads, tokens, head_dim), dtype=torch.float16, device=device)
+        k_out = torch.empty_like(q_out)
+        v_out = torch.empty_like(q_out)
+    else:
+        q_out, k_out, v_out = outputs
+        if any(t.shape != (1, local_heads, tokens, head_dim) or t.dtype != torch.float16 or t.device != device for t in outputs):
+            raise RuntimeError('acquired QKV workspace does not match the execution plan')
     for start in range(0, tokens, query_chunk):
         stop = min(tokens, start + query_chunk)
         q, k, v = _local_qkv_chunk(attention, value[start:stop], qkv_weight, q_weight, k_weight, None if rope is None else rope[:, start:stop], local_heads, already_scaled=already_scaled)
@@ -276,6 +287,7 @@ def _local_audio(qkv, audio_ranges, heads, head_dim, key_chunk):
     from .h3_mixed_precision import _streaming_audio_attention
     q, k, v = qkv
     return _streaming_audio_attention(q, k, v, audio_ranges, heads, head_dim, key_chunk=key_chunk, transformer_options=None)
+
 
 def _release_exact_qkv_inputs(values):
     """Drop preparation-only references after both synchronized QKV workers.
@@ -336,15 +348,16 @@ def _inference_worker(function, *args, **kwargs):
     with torch.inference_mode():
         return function(*args, **kwargs)
 
+
 @dataclass
 class DualExactAttentionState:
     secondary_index: int | None = None
     performance_floor_tokens: int = 16384
     query_chunk: int = 2048
-    block_count: int = 0
     weight_profile: str = FP8_E4M3_PROFILE
     _pool: _PinnedPool | None = field(default=None, init=False, repr=False)
     _executor: concurrent.futures.ThreadPoolExecutor = field(default_factory=lambda: concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix='h3-dual-v100'), init=False, repr=False)
+    _graph_executor: concurrent.futures.ThreadPoolExecutor = field(default_factory=lambda: concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='h3-dual-graph-owner'), init=False, repr=False)
     _lock: threading.Lock = field(default_factory=lambda: _DUAL_RUN_LOCK, init=False, repr=False)
     _disabled_signatures: set = field(default_factory=set, init=False, repr=False)
     _transient_local: threading.local = field(default_factory=threading.local, init=False, repr=False)
@@ -352,7 +365,22 @@ class DualExactAttentionState:
 
     def begin_sample(self):
         self._transient_local.failures = set()
+        self._transient_local.resource_reprobes = {}
+        self._transient_local.admission_warnings = set()
         self._transient_local.cache_recovery_backoff = {}
+        self._transient_local.wddm_rebalance_attempted = set()
+        self._transient_local.wddm_balanced_leases = {}
+
+    def _warn_admission_fallback(self, tokens, mode, reason):
+        warned = getattr(self._transient_local, 'admission_warnings', None)
+        if warned is None:
+            warned = self._transient_local.admission_warnings = set()
+        key = (int(tokens), mode)
+        if key not in warned:
+            warned.add(key)
+            LOGGER.warning('H3 dual attention using single-device fallback: '
+                           'tokens=%d mode=%s reason=%s. Further identical warnings '
+                           'are suppressed for this sample.', int(tokens), mode, reason)
 
     def _base_bypass_reason(self, x, transformer_options):
         from .sol_attention import MODE_FLASH, MODE_SOL
@@ -382,6 +410,34 @@ class DualExactAttentionState:
         transient = _resource_failure(error) or (preflight and _recoverable_probe_failure(error))
         target = self._transient_failures() if transient else self._disabled_signatures
         target.add(key)
+        retries = getattr(self._transient_local, 'resource_reprobes', {})
+        if key in retries:
+            retries[key] = (retries[key][0], None)  # Invalidate older recovery.
+        if not preflight and _resource_failure(error):
+            if not hasattr(self._transient_local, 'resource_reprobes'):
+                self._transient_local.resource_reprobes = {}
+            retries = self._transient_local.resource_reprobes
+            count = retries.get(key, (0, None))[0] + 1
+            ticket = object()
+            retries[key] = (count, ticket)
+            if count <= RESOURCE_REPROBES_PER_SAMPLE:
+                # Captures metadata only. No CUDA traceback/target survives here.
+                return lambda: self._allow_resource_reprobe(key, ticket)
+        return None
+
+    def _allow_resource_reprobe(self, key, ticket):
+        """A completed fallback block permits fresh admission, never a bypass."""
+        retries = getattr(self._transient_local, 'resource_reprobes', {})
+        count, current = retries.get(key, (0, None))
+        if (current is not ticket or key in self._disabled_signatures
+                or key not in self._transient_failures()):
+            return False
+        retries[key] = (count, None)  # Consume once; keep the sample-wide budget.
+        self._transient_failures().discard(key)
+        LOGGER.info('H3 dual attention resource recovery: single-device block '
+                    'completed; fresh dual admission allowed (%d/%d).',
+                    count, RESOURCE_REPROBES_PER_SAMPLE)
+        return True
 
     def _host_snapshot(self):
         live = system_host_memory()
@@ -418,7 +474,7 @@ class DualExactAttentionState:
                 except Exception as error:
                     if not _recoverable_probe_failure(error):
                         raise
-                    probe_errors.append(f'cuda:{index}: {type(error).__name__}: {error}')
+                    probe_errors.append(f'cuda:{index}: {type(error).__name__}')
                     continue
                 if accepted:
                     eligible.append(int(index))
@@ -438,7 +494,7 @@ class DualExactAttentionState:
             except Exception as error:
                 if not _recoverable_probe_failure(error):
                     raise
-                probe_errors.append(f'cuda:{index}: {type(error).__name__}: {error}')
+                probe_errors.append(f'cuda:{index}: {type(error).__name__}')
                 continue
             if host is None:
                 host = self._host_snapshot()
@@ -504,10 +560,190 @@ class DualExactAttentionState:
             return False
         return True
 
+    def _wddm_rebalance_attempted(self):
+        if not hasattr(self._transient_local, 'wddm_rebalance_attempted'):
+            self._transient_local.wddm_rebalance_attempted = set()
+        return self._transient_local.wddm_rebalance_attempted
+
+    def _balanced_lease_key(self, primary, tokens, hidden, requirements):
+        return (
+            int(primary), int(tokens), int(hidden), self.weight_profile,
+            int(requirements.get('query_chunk', self.query_chunk)),
+            int(requirements.get('audio_rows', 0)),
+            int(requirements.get('audio_key_chunk', 0)),
+            int(requirements.get('attention_decode_extra_bytes', 0)),
+        )
+
+    def _balanced_leases(self):
+        if not hasattr(self._transient_local, 'wddm_balanced_leases'):
+            self._transient_local.wddm_balanced_leases = {}
+        return self._transient_local.wddm_balanced_leases
+
+    def _remember_balanced_lease(self, selected, primary, tokens, hidden, requirements):
+        """Lease only a balanced exact plan that completed successfully."""
+        runtime, admission, _reason = selected
+        if runtime is None or admission is None or not admission.enabled:
+            return
+        plan = admission.attention
+        if (
+            bool(requirements.get('sol_route'))
+            or int(tokens) < WDDM_REBALANCE_MIN_TOKENS
+            or int(plan.primary_units) != int(plan.secondary_units)
+        ):
+            return
+        key = self._balanced_lease_key(primary, tokens, hidden, requirements)
+        self._balanced_leases()[key] = selected
+
+    def _drop_balanced_lease(self, primary, tokens, hidden, requirements):
+        key = self._balanced_lease_key(primary, tokens, hidden, requirements)
+        self._balanced_leases().pop(key, None)
+
+    def _validated_balanced_lease(
+        self, primary, tokens, hidden, head_dim, rope, total_heads, requirements
+    ):
+        """Reuse a proven same-shape plan while allocator-owned capacity remains.
+
+        Driver-free memory alone drops after PyTorch caches recurring QKV/range
+        workspaces.  A completed plan proves those shapes can execute.  The
+        lease still checks current driver-free plus reclaimable allocator bytes,
+        the secondary's live capacity, the pinned pool, and a hard free floor.
+        """
+        if bool(requirements.get('sol_route')) or int(tokens) < WDDM_REBALANCE_MIN_TOKENS:
+            return None
+        key = self._balanced_lease_key(primary, tokens, hidden, requirements)
+        selected = self._balanced_leases().get(key)
+        if selected is None:
+            return None
+        runtime, admission, _reason = selected
+        plan = admission.attention
+        if not _pool_matches_admission(
+            self._pool, admission, hidden, head_dim, self.query_chunk, rope,
+            sol_route=False, total_heads=total_heads,
+        ):
+            self._balanced_leases().pop(key, None)
+            return None
+        try:
+            from .runtime_memory import memory_snapshot
+            primary_snapshot = memory_snapshot(torch.device('cuda', int(primary)))
+            secondary_memory = torch_device_memory(runtime.secondary_index)
+            host = self._host_snapshot()
+        except Exception as error:
+            if not _recoverable_probe_failure(error):
+                raise
+            self._balanced_leases().pop(key, None)
+            return None
+        primary_effective = int(primary_snapshot['free_bytes']) + int(primary_snapshot['reclaimable_bytes'])
+        primary_needed = int(plan.primary_required_bytes) + int(plan.primary_reserve_bytes)
+        secondary_needed = int(plan.secondary_required_bytes) + int(plan.secondary_reserve_bytes)
+        driver_floor = max(
+            WDDM_LEASE_MIN_DRIVER_FREE_MIB * 1024 ** 2,
+            int(primary_snapshot['total_bytes']) * 3 // 100,
+        )
+        host_reserve = max(2 * 1024 ** 3, int(host.total_bytes * 0.05))
+        host_usable = max(0, int(host.available_bytes) - host_reserve)
+        host_limit = min(int(host.total_bytes * 0.08), int(host_usable * 0.2))
+        valid = (
+            int(primary_snapshot['free_bytes']) >= driver_floor
+            and primary_effective >= primary_needed
+            and int(secondary_memory.free_bytes) >= secondary_needed
+            and host_usable >= int(admission.staging.required_bytes)
+            and int(admission.staging.required_bytes) <= host_limit
+        )
+        if not valid:
+            self._balanced_leases().pop(key, None)
+            return None
+        return selected
+
+    def _rebalance_admitted_exact_cache(self, selected, options, tokens, hidden, requirements):
+        """Reclaim inactive primary cache once when it materially improves exact balance.
+
+        This is a WDDM performance optimization, not a capacity escape hatch.
+        The existing admitted plan remains valid throughout.  It never releases
+        DynamicVRAM pages, changes reserves, or retries repeatedly within one
+        sampler segment.
+        """
+        runtime, admission, _reason = selected
+        if runtime is None or admission is None or not admission.enabled:
+            return selected
+        if bool(requirements.get('sol_route')) or int(tokens) < WDDM_REBALANCE_MIN_TOKENS:
+            return selected
+        plan = admission.attention
+        if plan.primary_units >= plan.secondary_units:
+            return selected
+        current_bottleneck = max(int(plan.primary_units), int(plan.secondary_units))
+        key = self._cache_recovery_key(admission, tokens, requirements)
+        attempted = self._wddm_rebalance_attempted()
+        if key in attempted:
+            return selected
+        from .runtime_memory import POLICY_KEY, H3RuntimeMemoryPolicy, memory_snapshot, request_cuda_headroom
+        policy = options.get(POLICY_KEY)
+        if not isinstance(policy, H3RuntimeMemoryPolicy):
+            return selected
+        primary, secondary = admission.primary, admission.secondary
+        device = torch.device('cuda', primary.index)
+        snapshot = memory_snapshot(device)
+        reclaimable = int(snapshot['reclaimable_bytes'])
+        minimum_reclaimable = WDDM_REBALANCE_MIN_RECLAIMABLE_MIB * 1024 ** 2
+        if reclaimable < minimum_reclaimable:
+            return selected
+        from dataclasses import replace
+        potential_primary = replace(
+            primary,
+            free_bytes=min(
+                int(snapshot['total_bytes']),
+                int(snapshot['free_bytes']) + reclaimable,
+            ),
+        )
+        potential = self._runtime(
+            primary.index,
+            secondary.index,
+            {primary.index: potential_primary, secondary.index: secondary},
+            admission.host,
+        ).prepare(tokens, **requirements)
+        if not potential.enabled:
+            return selected
+        potential_plan = potential.attention
+        potential_bottleneck = max(
+            int(potential_plan.primary_units), int(potential_plan.secondary_units)
+        )
+        head_gain = current_bottleneck - potential_bottleneck
+        if head_gain < WDDM_REBALANCE_MIN_HEAD_GAIN:
+            return selected
+        attempted.add(key)
+        target = int(potential_plan.primary_required_bytes + potential_plan.primary_reserve_bytes)
+        result = request_cuda_headroom(
+            device,
+            options,
+            reason='wddm-dual-balance-cache',
+            snapshot=snapshot,
+            required_free_bytes=target,
+            minimum_reclaimable_mib=WDDM_REBALANCE_MIN_RECLAIMABLE_MIB,
+            demand_bypass_cooldown=True,
+            honor_cooldown=True,
+            allow_vbar_release=False,
+        )
+        if not result.get('performed'):
+            return selected
+        refreshed = self._select_admission(primary.index, tokens, hidden, **requirements)
+        refreshed_admission = refreshed[1]
+        if refreshed_admission is None or not refreshed_admission.enabled:
+            return selected
+        refreshed_plan = refreshed_admission.attention
+        refreshed_bottleneck = max(
+            int(refreshed_plan.primary_units), int(refreshed_plan.secondary_units)
+        )
+        if refreshed_bottleneck >= current_bottleneck:
+            return selected
+        return refreshed
+
     def _coordinated_admission(self, primary, tokens, hidden, options, **requirements):
         selected = self._select_admission(primary, tokens, hidden, **requirements)
         runtime, admission, _reason = selected
         if admission is not None and admission.enabled:
+            selected = self._rebalance_admitted_exact_cache(
+                selected, options, tokens, hidden, requirements
+            )
+            admission = selected[1]
             backoff = self._cache_recovery_backoff()
             if backoff:
                 backoff.pop(self._cache_recovery_key(admission, tokens, requirements), None)
@@ -515,7 +751,6 @@ class DualExactAttentionState:
         if runtime is None or not self._recover_primary_admission_cache(admission, options, tokens, requirements):
             return selected
         selected = self._select_admission(primary, tokens, hidden, **requirements)
-        from .runtime_memory import _runtime_state
         key = 'readmitted' if selected[1] is not None and selected[1].enabled else 'still_rejected'
         if key == 'readmitted':
             backoff = self._cache_recovery_backoff()
@@ -647,14 +882,35 @@ class DualExactAttentionState:
         audio_rows = sum((max(0, int(stop) - int(start)) for start, stop in audio_ranges))
         key_chunk = max(1, int(transformer_options.get('v100_h3_qkv_chunk_tokens', 1024)))
         requirements = dict(query_chunk=self.query_chunk, active_phases=('attention',), sol_route=dual_mode == 'sol_sparse', audio_rows=audio_rows, audio_key_chunk=key_chunk, host_attention_slots=1, attention_minimum_heads=8 if dual_mode == 'sol_sparse' else 19)
+        hidden = int(target.shape[1])
+        head_dim = int(attention.head_dim)
         if not self._lock.acquire(blocking=False):
             return fallback(target, rope_freqs=rope_freqs, transformer_options=transformer_options)
         runtime = admission = None
+        selected = None
         rejection_reason = None
+        from .graph_capacity import active_primary_graph, acquire as acquire_graph_workspace
+        graph_context = None
+        acquired_qkv = None
         try:
+            graph_context = active_primary_graph(target.device)
             if self.weight_profile == INT8_CONVROT_PROFILE:
                 requirements['attention_decode_extra_bytes'] = dual_attention_decode_extra_bytes(self.weight_profile, heads=int(attention.heads), head_dim=int(attention.head_dim), hidden=int(target.shape[1]))
-            runtime, admission, rejection_reason = self._coordinated_admission(primary_index, int(target.shape[0]), int(target.shape[1]), transformer_options, **requirements)
+            selected = None if graph_context is not None else self._validated_balanced_lease(
+                primary_index, int(target.shape[0]), hidden, head_dim,
+                rope_freqs, int(attention.heads), requirements,
+            )
+            if graph_context is not None:
+                selected, acquired_qkv, requirements = acquire_graph_workspace(
+                    self, primary_index, int(target.shape[0]), hidden, head_dim,
+                    transformer_options, requirements,
+                )
+            elif selected is None:
+                selected = self._coordinated_admission(
+                    primary_index, int(target.shape[0]), hidden,
+                    transformer_options, **requirements,
+                )
+            runtime, admission, rejection_reason = selected
         except Exception as error:
             if not isinstance(error, _ProbeUnavailable) and (not _recoverable_probe_failure(error)):
                 raise
@@ -670,18 +926,21 @@ class DualExactAttentionState:
         transaction.start()
         failure = None
         receipt = None
+        on_recovery = None
         admission_rejected = False
         qkv_futures = None
         audio_futures = None
         secondary_future = None
         primary_part = None
         cuda_started = False
+        graph_owned = False
+        propagating_error = False
         primary = torch.device('cuda', primary_index)
         secondary = torch.device('cuda', secondary_index)
         values = {'weights': None, 'out_weights': None, 'norms': None, 'x1': None, 'rope1': None, 'qkv': None, 'audio': None, 'returned': None, 'sol_streams': None, 'sol_iterators': None, 'pending': []}
+        values['primary_qkv'] = acquired_qkv
+        acquired_qkv = None
         try:
-            hidden = int(target.shape[1])
-            head_dim = int(attention.head_dim)
             for _attempt in range(2):
                 if not admission.enabled or _pool_matches_admission(self._pool, admission, hidden, head_dim, self.query_chunk, rope_freqs, sol_route=dual_mode == 'sol_sparse', total_heads=int(attention.heads)):
                     break
@@ -691,9 +950,21 @@ class DualExactAttentionState:
                 raise _DualAdmissionFallback
             primary_heads = int(admission.attention.primary_units)
             secondary_heads = int(admission.attention.secondary_units)
+            tokens = int(target.shape[0])
             pool = self._pool
             cuda_started = True
             values['returned'] = torch.empty((self.query_chunk, int(target.shape[1])), dtype=torch.float32, device=primary)
+            if graph_context is not None:
+                from .graph_attention import run as run_graph_owned
+                graph_owned = True
+                run_graph_owned(
+                    self, attention, target, rope_freqs, transformer_options,
+                    primary, secondary, primary_heads, secondary_heads,
+                    key_chunk, pool, audio_ranges, values, transaction,
+                    sol_config=sol_config,
+                )
+                transaction.commit()
+                return target
             if dual_mode == 'sol_sparse':
                 values['qkv'], values['out_weights'] = self._prepare_sol_qkv_and_output(attention, target, rope_freqs, transformer_options, primary, secondary, primary_heads, key_chunk, pool)
             else:
@@ -703,16 +974,15 @@ class DualExactAttentionState:
                     values['rope1'] = _stage_rope(rope_freqs, secondary, pool)
                 qkv_futures = (self._executor.submit(_inference_worker, _local_qkv, attention, target, values['weights'][0], *values['norms'][0], rope_freqs, primary_heads, key_chunk, already_scaled=False), self._executor.submit(_inference_worker, _local_qkv, attention, values['x1'], values['weights'][1], *values['norms'][1], values['rope1'], secondary_heads, key_chunk, already_scaled=True))
                 values['pending'] = list(qkv_futures)
-                values['qkv'] = tuple((future.result() for future in qkv_futures))
+                values['qkv'] = tuple(future.result() for future in qkv_futures)
                 values['pending'].clear()
                 qkv_futures = None
                 _release_exact_qkv_inputs(values)
             audio_futures = (self._executor.submit(_inference_worker, _local_audio, values['qkv'][0], audio_ranges, primary_heads, int(attention.head_dim), key_chunk), self._executor.submit(_inference_worker, _local_audio, values['qkv'][1], audio_ranges, secondary_heads, int(attention.head_dim), key_chunk))
             values['pending'] = list(audio_futures)
-            values['audio'] = tuple((future.result() for future in audio_futures))
+            values['audio'] = tuple(future.result() for future in audio_futures)
             values['pending'].clear()
             audio_futures = None
-            tokens = int(target.shape[0])
             scale = int(attention.head_dim) ** (-0.5)
             if dual_mode == 'sol_sparse':
                 effective_config = dict(sol_config)
@@ -783,50 +1053,100 @@ class DualExactAttentionState:
                     del primary_part
                     primary_part = None
             transaction.commit()
+            try:
+                self._remember_balanced_lease(
+                    (runtime, admission, rejection_reason),
+                    primary_index, tokens, hidden, requirements,
+                )
+            except Exception:
+                LOGGER.debug('H3 WDDM balanced lease update failed.', exc_info=True)
             return target
         except _DualAdmissionFallback:
             admission_rejected = True
+            self._warn_admission_fallback(int(target.shape[0]), dual_mode,
+                admission.reason if not admission.enabled else 'host-pool-unavailable')
+            self._drop_balanced_lease(
+                primary_index, int(target.shape[0]), hidden, requirements
+            )
             transaction.abort()
         except Exception as error:
-            failure = (type(error).__name__, str(error))
+            failure = (type(error).__name__, 'dual attention execution failed')
             receipt = transaction.abort()
-            if _fatal_device_failure(error):
+            self._drop_balanced_lease(
+                primary_index, int(target.shape[0]), hidden, requirements
+            )
+            fatal = _fatal_device_failure(error)
+            LOGGER.warning(
+                'H3 dual attention %s: mode=%s tokens=%d error=%s.',
+                'aborted' if fatal else 'quarantined for single-device retry',
+                dual_mode, int(target.shape[0]), type(error).__name__,
+            )
+            if fatal:
+                propagating_error = True
                 raise
-            self._quarantine(failure_key, error, preflight=not cuda_started)
+            on_recovery = self._quarantine(failure_key, error, preflight=not cuda_started)
+        except BaseException:
+            propagating_error = True
+            raise
         finally:
-            for future in values.get('pending') or ():
-                try:
-                    future.result()
-                except Exception:
-                    pass
-            for stream in values.get('sol_streams') or ():
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            qkv_futures = audio_futures = secondary_future = None
-            primary_part = None
-            for key in tuple(values):
-                values[key] = None
-            if cuda_started:
-                try:
-                    torch.cuda.synchronize(primary)
-                except Exception:
-                    pass
-                try:
-                    torch.cuda.synchronize(secondary)
-                except Exception:
-                    pass
-            self._lock.release()
+            cleanup_failure = None
+
+            def record_cleanup_failure(error):
+                nonlocal cleanup_failure
+                if cleanup_failure is None and _fatal_device_failure(error):
+                    # Keep the diagnostic, not a traceback retaining CUDA locals.
+                    cleanup_failure = RuntimeError(str(error))
+
+            try:
+                for future in values.get('pending') or ():
+                    try:
+                        future.result()
+                    except Exception as error:
+                        record_cleanup_failure(error)
+                for stream in values.get('sol_streams') or ():
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        record_cleanup_failure(error)
+                qkv_futures = audio_futures = secondary_future = None
+                primary_part = None
+                workspace = getattr(values.get('primary_qkv'), 'secondary', None)
+                if workspace is not None:
+                    from .graph_workspace import release_secondary
+                    try:
+                        release_secondary(self, workspace)
+                    except Exception as error:
+                        record_cleanup_failure(error)
+                        LOGGER.warning('H3 secondary QKV cleanup failed.', exc_info=True)
+                for key in tuple(values):
+                    values[key] = None
+                if cuda_started:
+                    try:
+                        torch.cuda.synchronize(primary)
+                    except Exception as error:
+                        record_cleanup_failure(error)
+                    if not graph_owned:
+                        try:
+                            torch.cuda.synchronize(secondary)
+                        except Exception as error:
+                            record_cleanup_failure(error)
+            finally:
+                self._lock.release()
+            if cleanup_failure is not None and not propagating_error:
+                raise cleanup_failure from None
         if admission_rejected:
             return fallback(target, rope_freqs=rope_freqs, transformer_options=transformer_options)
         for device in (primary, secondary):
             try:
+                if graph_owned and device == secondary:
+                    from .graph_attention import release_cached_secondary
+                    self._graph_executor.submit(_inference_worker, release_cached_secondary, secondary).result()
+                    continue
                 with torch.cuda.device(device):
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-        raise DualAttentionRetry(*failure, partial_target_write=receipt['fresh_target_required'], fallback=fallback, devices=(primary_index, secondary_index)) from None
+        raise DualAttentionRetry(*failure, partial_target_write=receipt['fresh_target_required'], fallback=fallback, devices=(primary_index, secondary_index), on_recovery=on_recovery) from None
 
 def make_retrying_block_core(single_attention):
     """Recreate disposable norm1 input before a transactional fallback."""
@@ -840,10 +1160,10 @@ def make_retrying_block_core(single_attention):
         try:
             attention_out = self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
         except DualAttentionRetry as retry:
-            retry_info = (retry.fallback, retry.devices)
+            retry_info = (retry.fallback, retry.devices, retry.on_recovery)
             retry.__traceback__ = None
         if retry_info is not None:
-            fallback, devices = retry_info
+            fallback, devices, on_recovery = retry_info
             del h
             for device_index in devices:
                 try:
@@ -856,7 +1176,10 @@ def make_retrying_block_core(single_attention):
         x = _mod_gate(x, gate_msa, attention_out, mod_segments)
         del h, attention_out
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
-        return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+        result = _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+        if retry_info is not None and on_recovery is not None:
+            on_recovery()
+        return result
     setattr(forward, BLOCK_PATCH_MARKER, True)
     return forward
 
@@ -895,8 +1218,8 @@ def dual_exact_attention_outer_sample_wrapper(executor, *args, **kwargs):
     state = options.get(OPTION_KEY)
     if not isinstance(state, DualExactAttentionState):
         return executor(*args, **kwargs)
-    state.begin_sample()
     try:
+        state.begin_sample()
         return executor(*args, **kwargs)
     finally:
         state.release_host_pool()
@@ -931,7 +1254,7 @@ class _DualAttentionInstaller:
         blocks = getattr(diffusion_model, 'blocks', None)
         if not blocks:
             raise RuntimeError('Dual Exact Attention expected MiniMax H3 blocks.')
-        state = DualExactAttentionState(secondary_index=_parse_secondary_device(secondary_device), block_count=len(blocks), weight_profile=options[WEIGHT_PROFILE_OPTION_KEY])
+        state = DualExactAttentionState(secondary_index=_parse_secondary_device(secondary_device), weight_profile=options[WEIGHT_PROFILE_OPTION_KEY])
         options[OPTION_KEY] = state
         for index, block in enumerate(blocks):
             attention_key = f'diffusion_model.blocks.{index}.attn.forward'

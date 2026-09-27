@@ -90,7 +90,7 @@ class AdaptiveBudgetState:
         except Exception as error:
             if _fatal_device_failure(error):
                 raise
-            failure = f'{type(error).__name__}: {error}'
+            failure = type(error).__name__
         if failure is not None:
             prior = previous = None
             self.release_history()

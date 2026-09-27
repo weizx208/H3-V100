@@ -133,12 +133,12 @@ def _projection_reuse_allowed(transformer_options, device, chunks, *, snapshot=N
             return (False, free_mib, 'driver_transfer_floor')
     return (True, free_mib, 'eligible')
 
-def _report_projection_reuse_fallback(projection, device, chunks, reason_type, reason_message):
-    key = (projection, device.index, reason_type, reason_message[:160])
+def _report_projection_reuse_fallback(projection, device, chunks, reason_type):
+    key = (projection, device.index, reason_type)
     if key in _projection_reuse_fallback_reported:
         return
     _projection_reuse_fallback_reported.add(key)
-    LOGGER.warning('H3 V100 long projection weight reuse fallback: projection=%s, chunks=%d, reason=%s. Restoring the validated per-chunk path.', projection, chunks, f'{reason_type}: {reason_message}')
+    LOGGER.warning('H3 V100 long projection weight reuse fallback: projection=%s, chunks=%d, reason=%s. Restoring the validated per-chunk path.', projection, chunks, reason_type)
 
 def _recover_projection_reuse_fallback(device):
     if device.type != 'cuda':
@@ -457,9 +457,8 @@ def _qkv_projection(self, proj_x, transformer_options, local_fp16_scale=1.0, ext
                 v_result[start:stop].copy_(v_part)
                 del part, q_part, k_part, v_part, input_part
             return (q_result, k_result, v_result)
-        reuse_allowed, _free_before_mib, admission_reason = _projection_reuse_allowed(transformer_options, proj_x.device, chunks, snapshot=trimmed.get('after') or trimmed.get('before') if trimmed is not None else None)
+        reuse_allowed, _, _ = _projection_reuse_allowed(transformer_options, proj_x.device, chunks, snapshot=trimmed.get('after') or trimmed.get('before') if trimmed is not None else None)
         fallback_type = None
-        fallback_message = None
         recover_resource_failure = False
         prepared_weight = None
         if reuse_allowed:
@@ -472,18 +471,16 @@ def _qkv_projection(self, proj_x, transformer_options, local_fp16_scale=1.0, ext
                 reuse_active = True
             except _ProjectionWeightReuseUnsupported as exc:
                 fallback_type = type(exc).__name__
-                fallback_message = str(exc)
             except Exception as exc:
                 if not _is_projection_weight_resource_error(exc):
                     raise
                 fallback_type = type(exc).__name__
-                fallback_message = str(exc)
                 recover_resource_failure = True
         prepared_weight = None
         if fallback_type is not None:
             q_out = k_out = v_out = None
             reserved_outputs = None
-            _report_projection_reuse_fallback('qkv', proj_x.device, chunks, fallback_type, fallback_message)
+            _report_projection_reuse_fallback('qkv', proj_x.device, chunks, fallback_type)
             if recover_resource_failure:
                 _recover_projection_reuse_fallback(proj_x.device)
         if not reuse_active:
@@ -522,9 +519,8 @@ def _out_projection(self, out, transformer_options):
                     projected = torch.empty((tokens,) + tuple(part.shape[1:]), dtype=part.dtype, device=part.device)
                 projected[start:start + part.shape[0]].copy_(part)
             return projected
-        reuse_allowed, _free_before_mib, admission_reason = _projection_reuse_allowed(transformer_options, out.device, chunks, snapshot=reuse_snapshot)
+        reuse_allowed, _, _ = _projection_reuse_allowed(transformer_options, out.device, chunks, snapshot=reuse_snapshot)
         fallback_type = None
-        fallback_message = None
         recover_resource_failure = False
         if reuse_allowed:
             try:
@@ -533,16 +529,14 @@ def _out_projection(self, out, transformer_options):
                 reuse_active = True
             except _ProjectionWeightReuseUnsupported as exc:
                 fallback_type = type(exc).__name__
-                fallback_message = str(exc)
             except Exception as exc:
                 if not _is_projection_weight_resource_error(exc):
                     raise
                 fallback_type = type(exc).__name__
-                fallback_message = str(exc)
                 recover_resource_failure = True
         if fallback_type is not None:
             result = None
-            _report_projection_reuse_fallback('out', out.device, chunks, fallback_type, fallback_message)
+            _report_projection_reuse_fallback('out', out.device, chunks, fallback_type)
             if recover_resource_failure:
                 _recover_projection_reuse_fallback(out.device)
         if not reuse_active:
@@ -624,7 +618,7 @@ def _consume_sol_range_stream(self, target, stream, transformer_options, *, audi
     except Exception as error:
         if _fatal_device_failure(error):
             raise
-        failure = (type(error).__name__, str(error))
+        failure = (type(error).__name__, 'corrected Sol stream failed')
     if failure is not None:
         exact = stream.exact_fallback(failure)
         if _is_sol_range_stream(exact):
@@ -863,6 +857,19 @@ class H3V100MixedPrecision:
         transformer_options = patched_model.model_options.setdefault('transformer_options', {})
         transformer_options[OPTION_KEY] = bool(v100_only)
         transformer_options[SOL_STREAM_OUTPUT_OPTION_KEY] = True
+        # The residual survives across DiT blocks. Its FP32 allocation must be
+        # owned by the root scope, not by the first block's malloc scope.
+        from .residual_lifetime import build as build_root_residual, MARKER as root_marker
+        root_key = 'diffusion_model._forward'
+        existing_root = patched_model.object_patches.get(root_key)
+        if existing_root is None:
+            root_forward = patched_model.get_model_object(root_key)
+            root_function = build_root_residual(getattr(root_forward, '__func__', root_forward))
+            if root_function is None:
+                raise RuntimeError('H3 residual lifetime requires a reviewed upstream MiniMaxH3Model._forward.')
+            patched_model.add_object_patch(root_key, types.MethodType(root_function, diffusion_model))
+        elif not getattr(getattr(existing_root, '__func__', existing_root), root_marker, False):
+            raise RuntimeError('H3 residual lifetime found another model forward patch.')
         token_refiner = getattr(diffusion_model, 'token_refiner', None)
         refiner_blocks = getattr(token_refiner, 'blocks', None)
         condition_proj = getattr(diffusion_model, 'condition_proj', None)

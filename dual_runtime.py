@@ -107,7 +107,7 @@ class DualAdaptiveAdmission:
         self.performance_floor_tokens = max(1, int(performance_floor_tokens))
         self._epoch = 0
 
-    def prepare(self, tokens: int, *, query_chunk: int=2048, mlp_chunk: int=640, sol_route: bool=False, active_phases: tuple[str, ...]=('attention', 'mlp'), audio_rows: int=0, audio_key_chunk: int=1024, host_attention_slots: int=2, attention_minimum_heads: int=19, attention_decode_extra_bytes: int=0) -> RuntimeAdmission:
+    def prepare(self, tokens: int, *, query_chunk: int=2048, mlp_chunk: int=640, sol_route: bool=False, active_phases: tuple[str, ...]=('attention', 'mlp'), audio_rows: int=0, audio_key_chunk: int=1024, host_attention_slots: int=2, attention_minimum_heads: int=19, attention_decode_extra_bytes: int=0, attention_primary_heads=None, attention_qkv_preallocated=False) -> RuntimeAdmission:
         """Sample both GPUs and RAM once, then bind every plan to one epoch."""
         active_phases = tuple(dict.fromkeys((str(value) for value in active_phases)))
         unknown = set(active_phases).difference(('attention', 'mlp'))
@@ -121,7 +121,7 @@ class DualAdaptiveAdmission:
             disabled = ParallelPlan(False, 0, 0, 0, 0, 0, 0, 0, 0, 'below-performance-floor')
             staging = HostStagingPlan(False, 0, 0, 0, 0, 0, 0, 0, 'gpu-plan-disabled')
             return RuntimeAdmission(False, self._epoch, tokens, primary, secondary, host, disabled, disabled, staging, active_phases, 'below-performance-floor')
-        attention = plan_attention_heads(tokens, query_chunk, primary, secondary, sol_route=sol_route, audio_rows=audio_rows, audio_key_chunk=audio_key_chunk, minimum_heads=attention_minimum_heads, primary_decode_extra_bytes=attention_decode_extra_bytes)
+        attention = plan_attention_heads(tokens, query_chunk, primary, secondary, sol_route=sol_route, audio_rows=audio_rows, audio_key_chunk=audio_key_chunk, minimum_heads=attention_minimum_heads, primary_decode_extra_bytes=attention_decode_extra_bytes, fixed_primary_heads=attention_primary_heads, primary_qkv_preallocated=attention_qkv_preallocated)
         mlp = plan_mlp_channels(tokens, mlp_chunk, primary, secondary) if 'mlp' in active_phases else ParallelPlan(False, 0, 0, 0, 0, 0, 0, 0, 0, 'phase-inactive')
         staging = plan_host_staging(tokens, query_chunk, host, attention, mlp, mlp_chunk_tokens=mlp_chunk, sol_route=sol_route, use_attention='attention' in active_phases, use_mlp='mlp' in active_phases, attention_slot_options=(max(1, int(host_attention_slots)),))
         attention_required = 'attention' in active_phases
@@ -155,4 +155,12 @@ class DualAdaptiveAdmission:
 
 
 def _fatal_device_failure(error):
-    return any((text in str(error).lower() for text in ('illegal memory access', 'device-side assert', 'misaligned address', 'unspecified launch failure', 'device has been lost', 'device is lost')))
+    # PyTorch appends generic CUDA advice (including "enable device-side
+    # assertions") to otherwise recoverable errors. Only the diagnostic
+    # headline identifies the failure; matching the whole message turns an
+    # ordinary invalid-argument transfer into a falsely fatal device error.
+    headline = str(error).splitlines()[0].lower() if str(error) else ''
+    return any(text in headline for text in (
+        'illegal memory access', 'device-side assert', 'misaligned address',
+        'unspecified launch failure', 'device has been lost', 'device is lost',
+    ))

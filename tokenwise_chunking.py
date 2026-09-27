@@ -414,21 +414,20 @@ def _make_forward(original_forward, block_index, transformer_options, expected_d
                 else:
                     fallback_exc = None
                     try:
-                        with _prepare_mlp_weight_pair(self, x, transformer_options) as (prepared_weights, expanded_bytes):
-                            expanded_mib = None
+                        with _prepare_mlp_weight_pair(self, x, transformer_options) as (prepared_weights, _):
                             result = execute_chunks(prepared_weights)
                     except _WeightPairUnsupported as exc:
-                        fallback_exc = (type(exc).__name__, str(exc), True)
+                        fallback_exc = type(exc).__name__
                     except Exception as exc:
                         if not _is_weight_pair_resource_error(exc):
                             raise
-                        fallback_exc = (type(exc).__name__, str(exc), False)
+                        fallback_exc = type(exc).__name__
                     if fallback_exc is not None:
                         prepared_weights = None
-                        fallback_key = (x.device.index, block_index, fallback_exc[0], fallback_exc[1][:160])
+                        fallback_key = (x.device.index, block_index, fallback_exc)
                         if fallback_key not in _weight_pair_fallback_reported:
                             _weight_pair_fallback_reported.add(fallback_key)
-                            LOGGER.warning('H3 Dynamic MLP weight-pair reuse fallback: block=%d chunks=%d reason=%s. Restoring the validated per-chunk cast path.', block_index, chunks, fallback_exc[1])
+                            LOGGER.warning('H3 Dynamic MLP weight-pair reuse fallback: block=%d chunks=%d reason=%s. Restoring the validated per-chunk cast path.', block_index, chunks, fallback_exc)
                         torch.cuda.synchronize(x.device)
                         torch.cuda.empty_cache()
                         result = execute_chunks()

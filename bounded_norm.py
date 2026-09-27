@@ -31,7 +31,7 @@ def execute_with_recovery(original_forward, x, rows, recover):
         try:
             return original_forward(x) if rows >= x.shape[0] else run_chunked_norm(original_forward, x, rows)
         except torch.cuda.OutOfMemoryError as error:
-            failure = str(error)
+            failure = type(error).__name__
         if rows <= 1:
             raise torch.cuda.OutOfMemoryError('H3 norm2 minimum workspace failed; full output still required: ' + failure) from None
         rows = max(1, rows // 2)
@@ -47,12 +47,12 @@ def run_chunked_norm(original_forward, x, chunk_rows=CHUNK_ROWS, out=None):
         del part
     return out
 
-def try_cached_norm(original_forward, x, reserve_bytes, free_bytes, cached_bytes):
+def try_cached_norm(original_forward, x, reserve_bytes, free_bytes, cached_bytes, *, acquire_from_graph=False):
     """Try actual output storage without crediting aggregate cache as capacity.
 
     Both the pre-check and the fresh check after allocation retain the original
     driver reserve plus two tile temporaries. A fragmented cache or operator
-    OOM returns to the unchanged dev9 path after all partial tensors are gone.
+    OOM returns to the validated bounded execution path after partial tensors are gone.
     """
     tokens, width = x.shape
     row_bytes = width * 4
@@ -60,7 +60,7 @@ def try_cached_norm(original_forward, x, reserve_bytes, free_bytes, cached_bytes
     slack = 2 * 1024 ** 2 + tokens * 8
     minimum_rows = min(tokens, CHUNK_ROWS)
     minimum_free = reserve_bytes + slack + 2 * minimum_rows * row_bytes
-    if cached_bytes < output_bytes or free_bytes < minimum_free:
+    if (cached_bytes < output_bytes and not acquire_from_graph) or free_bytes < minimum_free:
         return (None, 0, 'ineligible')
     try:
         out = torch.empty_like(x)
@@ -89,8 +89,10 @@ def make_bounded_norm(original_forward, stage='norm2'):
         rows = plan_rows(tokens, width, free, reserve)
         cached_result = None
         if rows == 0:
+            from .graph_capacity import active_primary_graph
             cached_bytes = max(0, torch.cuda.memory_reserved(x.device) - torch.cuda.memory_allocated(x.device))
-            cached_result, cached_rows, outcome = try_cached_norm(original_forward, x, reserve, free, cached_bytes)
+            cached_result, cached_rows, outcome = try_cached_norm(original_forward, x, reserve, free, cached_bytes,
+                acquire_from_graph=active_primary_graph(x.device) is not None)
             if cached_result is not None:
                 rows = cached_rows
         if rows == 0:
