@@ -1,10 +1,10 @@
-# H3 V100 Optimize 2.0.2
+# H3 V100 Optimize 2.0.3
 
 [简体中文](README_zh-CN.md) | English
 
 A MiniMax H3 acceleration node for ComfyUI on NVIDIA V100. One node combines model optimization, Flash / SOL attention, EasyCache, and optional dual-GPU execution.
 
-2.0.2 builds on 2.0.0 with improved WDDM long-sequence dual-GPU scheduling, repeated-run and resource-error recovery, and corrected SOL preset controls. The node acts on its input MODEL branch and does not rewrite ComfyUI or other nodes; it supports compatible MiniMax H3 model structures only.
+2.0.3 fixes a reproduced long-sequence numerical overflow. 2.0.2 builds on 2.0.0 with improved WDDM long-sequence dual-GPU scheduling, repeated-run and resource-error recovery, and corrected SOL preset controls. The node acts on its input MODEL branch and does not rewrite ComfyUI or other nodes; it supports compatible MiniMax H3 model structures only.
 
 ## Demo
 
@@ -22,7 +22,7 @@ A MiniMax H3 acceleration node for ComfyUI on NVIDIA V100. One node combines mod
 - **EasyCache**: Off, Quality, and Speed, with separate video and audio safeguards.
 - **Improved two-stage sampling**, including latent upscaling and Sigma Refiner workflows.
 
-Core compute and memory policies apply automatically; no separate memory-management node is required. See [release notes](RELEASE_NOTES.md) for the complete changes since v2.0.0.
+Core compute and memory policies apply automatically; no separate memory-management node is required. See [release notes](RELEASE_NOTES.md) for the v2.0.3 fix.
 
 ## Requirements
 

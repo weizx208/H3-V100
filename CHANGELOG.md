@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.0.3
+
+- Fix an FP16 overflow in the MLP output projection observed in a long-sequence
+  second-stage sample. It produced non-finite video/audio and AAC export failure.
+
 ## v2.0.2
 
 Changes since v2.0.0.

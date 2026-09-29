@@ -24,7 +24,8 @@ QKV_CACHE_TRIM_THRESHOLD_KEY = 'v100_h3_qkv_cache_trim_threshold_mb'
 EXPERIMENTAL_FP16_KEY = 'v100_h3_experimental_fp16_linear'
 SCALED_FP16_SWIGLU_KEY = 'v100_h3_scaled_fp16_swiglu'
 _SWIGLU_BRANCH_SCALE = 16.0
-_SWIGLU_FC2_SCALE = 8.0
+# Keep FC2 at the same /256 scale as the FP32 SwiGLU path before its FP16 output.
+_SWIGLU_FC2_SCALE = 16.0
 CONTROLLER_ATTR = '_h3_v100_dynamic_vbar_policy'
 _UPGRADE_STABLE_CALLS = 3
 _UPGRADE_BUDGET_MARGIN_TOKENS = 1024

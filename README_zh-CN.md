@@ -1,10 +1,10 @@
-# H3 V100 Optimize 2.0.2
+# H3 V100 Optimize 2.0.3
 
 简体中文 | [English](README.md)
 
 面向 NVIDIA V100 的 MiniMax H3 ComfyUI 加速节点，将模型优化、Flash / SOL、EasyCache 和双卡支持集中在一个节点中。
 
-2.0.2 在 2.0.0 的基础上改善 WDDM 长序列双卡调度、连续运行与资源错误恢复，并修正 SOL 档位控制。节点作用于传入的 MODEL 分支，不改写 ComfyUI 或其他节点的源文件；仅适用于受支持的 MiniMax H3 模型结构。
+2.0.3 修复了已复现的长序列数值溢出问题。2.0.2 在 2.0.0 的基础上改善 WDDM 长序列双卡调度、连续运行与资源错误恢复，并修正 SOL 档位控制。节点作用于传入的 MODEL 分支，不改写 ComfyUI 或其他节点的源文件；仅适用于受支持的 MiniMax H3 模型结构。
 
 ## 演示
 
@@ -22,7 +22,7 @@
 - **EasyCache**：Off、Quality、Speed，加入音视频分别保护的缓存加速。
 - **双采支持完善**：支持两段采样，可配合 latent 放大及 Sigma Refiner。
 
-基础计算与显存策略自动生效，无需另外连接显存管理节点。相对 2.0.0 的完整改动见 [2.0.2 更新说明](RELEASE_NOTES.md)。
+基础计算与显存策略自动生效，无需另外连接显存管理节点。本次修复见 [2.0.3 更新说明](RELEASE_NOTES.md)；此前更新记录见 CHANGELOG.md。
 
 ## 运行环境
 
